@@ -1,0 +1,23 @@
+node_modules/
+dist-pos/
+dist-demo/
+dist-loaner/
+dist-cloud/
+dist-app/
+dist-check/
+dist-check-app/
+dist-keys/
+dist-gen/
+dist-ceo/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Licence and technician signing keys. A private key never belongs in a
+# repository: the whole point of signing a licence is that only the owner's
+# own machine can do it.
+*private-key*.json
+corecashier-key*.json
+coreos-technician-private-key*.json

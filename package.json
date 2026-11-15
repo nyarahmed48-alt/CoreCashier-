@@ -1,0 +1,44 @@
+{
+  "name": "corecashier",
+  "private": true,
+  "version": "1.0.0",
+  "description": "CoreCashier — an offline-first tablet till for Iraqi shops, in Arabic, Kurdish and English.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build:pos": "vite build --config vite.pos.config.ts && node scripts/build-portable-pos.mjs dist-pos pos-portable.html CoreCashier.html",
+    "build:demo": "vite build --config vite.demo.config.ts && node scripts/build-portable-pos.mjs dist-demo demo-portable.html CoreCashier_Demo.html",
+    "build:loaner": "vite build --config vite.loaner.config.ts && node scripts/build-portable-pos.mjs dist-loaner loaner-portable.html CoreCashier_Loaner.html",
+    "build:cloud": "vite build --config vite.cloud.config.ts && node scripts/build-portable-pos.mjs dist-cloud cloud-portable.html CoreCashier_Cloud.html",
+    "build:app": "vite build --config vite.app.config.ts && node scripts/build-app.mjs",
+    "build:check": "vite build --config vite.check.config.ts && node scripts/build-portable-pos.mjs dist-check check-portable.html CoreOS_Device_Check.html",
+    "build:check-app": "vite build --config vite.checkapp.config.ts && node scripts/build-app.mjs dist-check-app check-index.html devicecheck",
+    "build:keys": "vite build --config vite.keymaker.config.ts && node scripts/build-portable-pos.mjs dist-keys keymaker-portable.html CoreOS_Key_Maker.html",
+    "build:gen": "vite build --config vite.generator.config.ts && node scripts/build-portable-pos.mjs dist-gen generator-portable.html CoreCashier_Code_Generator.html",
+    "build:ceo": "vite build --config vite.ceo.config.ts && node scripts/build-portable-pos.mjs dist-ceo ceo-portable.html CoreCashier_Owner_Console.html",
+    "build:all": "npm run build:pos && npm run build:demo && npm run build:loaner && npm run build:cloud && npm run build:check && npm run build:keys && npm run build:gen && npm run build:ceo"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.1.14",
+    "@vitejs/plugin-react": "^5.0.4",
+    "@zxing/library": "^0.21.3",
+    "lucide-react": "^0.546.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "fake-indexeddb": "^6.2.6",
+    "tailwindcss": "^4.1.14",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.3",
+    "vitest": "^2.1.9"
+  }
+}
