@@ -35,6 +35,17 @@ export interface Product {
   /** Archived products stay in the file so old receipts still read correctly,
       but they leave the till grid. */
   archived: boolean;
+  /**
+   * When this product's description — its name, price, category — was last
+   * changed, and on which tablet's clock.
+   *
+   * Only the Cloud plan uses it, and only to settle a disagreement: two
+   * tills editing the same price while both offline, the later edit wins.
+   * Absent on a product nobody has edited since the shop started, and on
+   * every product of an Offline shop, where there is nobody to disagree
+   * with. Missing counts as older than anything.
+   */
+  editedAt?: string;
 }
 
 /** A line is a copy, not a reference: a receipt from March must still show
@@ -191,6 +202,8 @@ export interface Customer {
   name: string;
   phone: string;
   createdAt: string;
+  /** As for Product: which edit is the newer one. */
+  editedAt?: string;
 }
 
 /** A line in one customer's page of the book: goods taken, or money paid. */

@@ -20,7 +20,6 @@
 import { reportError } from "./reportIssue";
 import { backupPage, dataFromBackup } from "./backupFile";
 import { isCloud } from "./edition";
-import { markPending } from "./cloud";
 import { useSyncExternalStore } from "react";
 import type {
   AuditEntry,
@@ -55,31 +54,16 @@ import {
 } from "./migrate";
 import { askToPersist, readAll, write, type Change, type StoreName } from "./db";
 import { roundTotal } from "./money";
+import { newId } from "./ids";
+import { enqueue, event, loadOutbox, stockEvent, type OutEvent } from "./outbox";
+
+/** Re-exported: this was defined here for a year and half the app
+    imports it from the store. See ids.ts for why it moved. */
+export { newId };
 
 const DATA_KEY = "coreos.pos.data.v1";
 const CART_KEY = "coreos.pos.cart.v1";
 const DATA_VERSION = 1;
-
-/**
- * A full UUID, never a slice of one.
- *
- * This used to keep the first eight characters, which is thirty-two bits: two
- * records of the same kind start colliding around seventy-seven thousand of
- * them, and a shop with fifty thousand sales was inside the range where two
- * could share an id. Once several tablets sync into one set of books, an id
- * collision stops being a curiosity and becomes one shop's sale overwriting
- * another's.
- */
-export function newId(prefix: string): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return `${prefix}-${crypto.randomUUID()}`;
-  }
-  // Old WebViews: four blocks of randomness, same width, no uniqueness claim
-  // beyond what the device's own Math.random can offer.
-  let out = "";
-  for (let i = 0; i < 4; i++) out += Math.random().toString(36).slice(2, 10);
-  return `${prefix}-${out}`;
-}
 
 /** Arabic unless the shop says otherwise: most of these counters are in
     Baghdad, and a till that opens in English is a till somebody has to
@@ -247,6 +231,12 @@ async function boot(): Promise<void> {
       readAll<DayClose>("closes"),
     ]);
 
+    /* What the office has not been told about yet, back into memory. A till
+       restarted mid-sync — the tablet died, the browser was killed, the
+       shop pulled the plug at closing — picks up exactly where it was,
+       because nothing left this queue without a 2xx. */
+    loadOutbox(await readAll<OutEvent>("outbox"));
+
     const saved = settingsRows.find((row) => row.id === "settings");
     const lang = saved?.lang ?? FIRST_LANG;
     const settings = { ...defaultSettings(lang), ...(saved ?? {}) } as Settings;
@@ -305,7 +295,14 @@ export function storageProblem(): string {
   return bootProblem;
 }
 
-void boot();
+/* The one promise anything that touches the books from outside a React
+   screen has to wait on. Screens have `useStorageReady`; the sync worker,
+   which can be woken by the network before the first render, has this. */
+const booted = boot();
+
+export function whenReady(): Promise<void> {
+  return booted;
+}
 
 function persist(key: string, value: unknown) {
   try {
@@ -409,29 +406,22 @@ function changesBetween(before: PosData, after: PosData): Change[] {
    and the order is preserved because each write waits for the one before. */
 let writing: Promise<void> = Promise.resolve();
 
-/** The stores the office keeps a copy of. Shifts, staff and the audit log
-    stay on the tablet: they are how a shop runs its own counter, not
-    something CoreOs has any business holding. */
-const SYNCED: StoreName[] = ["sales", "products", "debts", "closes"];
+/* What the office never sees, and why it is a list of what is absent rather
+   than a filter: shifts, staff and the audit log are how a shop runs its own
+   counter — who was on the till, who approved a void, what each person was
+   paid attention to. CoreOs has no business holding any of it, so no action
+   below builds an event for them. */
 
-function queue(changes: Change[]) {
-  if (changes.length === 0) return;
-
-  /* On the Cloud plan, note what changed so it can go up later. Noted here,
-     at the one funnel every write passes through, rather than in each of the
-     fifteen functions that call it — a sale that gets written to the tablet
-     but never noted is a sale the office never sees. */
-  if (isCloud) {
-    const touched: string[] = [];
-    for (const change of changes) {
-      if (!SYNCED.includes(change.store)) continue;
-      for (const row of change.put ?? []) {
-        const id = (row as { id?: string }).id;
-        if (id) touched.push(`${change.store}:${id}`);
-      }
-    }
-    markPending(touched);
+function queue(changes: Change[], events: OutEvent[] = []) {
+  /* On the Cloud plan the events ride along in the same transaction. They
+     are built by the action — only `completeSale` knows that two of a thing
+     left the shelf rather than that the number is now different — and the
+     one place they are written is here. */
+  if (isCloud && events.length > 0) {
+    const entry = enqueue(events);
+    if (entry) changes = [...changes, entry];
   }
+  if (changes.length === 0) return;
 
   writing = writing
     .then(() => write(changes))
@@ -453,12 +443,26 @@ export function flushed(): Promise<void> {
   return writing;
 }
 
-function commit(next: PosData) {
+/**
+ * The books move, and the office is told what moved.
+ *
+ * `events` is the Cloud plan's half. They go into the same `write()` as the
+ * sale itself, so a tablet that dies between the two is not a thing that can
+ * happen: either the shop has the sale and the office will hear about it, or
+ * neither. Everything that changes the books goes through here, which is the
+ * only reason that promise can be made at all.
+ *
+ * On the Offline plan the events are built and thrown away — a few objects
+ * per sale, not worth a branch at every call site. On a till that has fallen
+ * back to localStorage there is no transaction to join, and the Cloud plan
+ * does not run there anyway.
+ */
+function commit(next: PosData, events: OutEvent[] = []) {
   const before = data;
   data = next;
   messageLang = next.settings.lang;
   if (storageMode === "localStorage") persist(DATA_KEY, data);
-  else queue(changesBetween(before, next));
+  else queue(changesBetween(before, next), events);
   notify();
 }
 
@@ -506,6 +510,12 @@ export function useCart(): CartLine[] {
     () => cart,
     () => cart,
   );
+}
+
+/** The basket, without a React hook around it. For the tests, and for
+    anything that needs to price the cart outside a render. */
+export function theCart(): CartLine[] {
+  return cart;
 }
 
 /* --------------------------------------------------------------- read-only */
@@ -572,33 +582,76 @@ export function useWriteError(): string {
 
 export function saveProduct(product: Product) {
   if (readOnly) return;
-  const exists = data.products.some((p) => p.id === product.id);
+  const was = data.products.find((p) => p.id === product.id);
+  const at = new Date().toISOString();
+
+  /* Two different facts can come out of one save, and they are kept apart
+     on purpose. The name and the price are a *description*, and the last
+     edit wins. The stock count is a *quantity*, and quantities are only
+     ever moved by a delta — otherwise an owner correcting the rice count on
+     one tablet would wipe out what the other tablet sold while he typed. */
+  product = { ...product, editedAt: at };
+  const events = [
+    productEvent(product, at),
+    ...(was && was.stock !== product.stock
+      ? [stockEvent(product.id, product.stock - was.stock, "counted", data.settings.tillId, undefined, at)]
+      : []),
+    ...(!was && product.stock !== 0
+      ? [stockEvent(product.id, product.stock, "opening", data.settings.tillId, undefined, at)]
+      : []),
+  ];
+
   commit(owned({
     ...data,
-    products: exists
+    products: was
       ? data.products.map((p) => (p.id === product.id ? product : p))
       : [...data.products, product],
-  }));
+  }), events);
+}
+
+/** A product as the office stores it: an edit, stamped, not a row to
+    overwrite. `edited_at` is what last-edit-wins is decided on, and it is
+    this tablet's clock — see the trigger in supabase/schema.sql. */
+function productEvent(product: Product, at: string) {
+  return event("product", newId("pe"), {
+    product_id: product.id,
+    name: product.name,
+    barcode: product.barcode ?? "",
+    category: product.categoryId ?? "",
+    price: product.price,
+    low_stock_at: product.lowStockAt,
+    archived: Boolean(product.archived),
+    edited_at: at,
+    till_id: data.settings.tillId,
+  }, at);
 }
 
 export function setArchived(id: string, archived: boolean) {
   if (readOnly) return;
-  commit(owned({
-    ...data,
-    products: data.products.map((p) => (p.id === id ? { ...p, archived } : p)),
-  }));
+  const stamp = new Date().toISOString();
+  const next = data.products.map((p) =>
+    p.id === id ? { ...p, archived, editedAt: stamp } : p,
+  );
+  const changed = next.find((p) => p.id === id);
+  commit(
+    owned({ ...data, products: next }),
+    changed ? [productEvent(changed, new Date().toISOString())] : [],
+  );
 }
 
 /** Goods arriving from the supplier. Kept separate from editing the count by
     hand so the common case is one tap and cannot mistype the running total. */
 export function receiveStock(id: string, units: number) {
   if (readOnly) return;
-  commit(owned({
-    ...data,
-    products: data.products.map((p) =>
-      p.id === id ? { ...p, stock: p.stock + units } : p,
-    ),
-  }));
+  commit(
+    owned({
+      ...data,
+      products: data.products.map((p) =>
+        p.id === id ? { ...p, stock: p.stock + units } : p,
+      ),
+    }),
+    [stockEvent(id, units, "received", data.settings.tillId)],
+  );
 }
 
 export function saveCategory(category: Category) {
@@ -800,6 +853,34 @@ export function completeSale(input: {
     sold.set(line.productId, (sold.get(line.productId) ?? 0) + line.qty);
   }
 
+  const owedLine: DebtEntry | null =
+    method === "later" && customer
+      ? {
+          id: newId("d"),
+          customerId: customer.id,
+          at: sale.at,
+          kind: "owed" as const,
+          amount: totals.total,
+          saleId: sale.id,
+          saleNo: sale.no,
+          receiptNo: sale.receiptNo,
+          staffId: who.id,
+          staffName: who.name,
+          note: "",
+        }
+      : null;
+
+  /* The sale, what left the shelf, and the line in the debt book, as three
+     facts rather than one blob. The office can lose none of them and can be
+     sent all of them twice. */
+  const events = [
+    saleEvent(sale),
+    ...[...sold.entries()].map(([productId, qty]) =>
+      stockEvent(productId, -qty, "sold", sale.deviceId, sale.id, sale.at),
+    ),
+    ...(owedLine ? [debtEvent(owedLine)] : []),
+  ];
+
   commit(owned({
     ...data,
     settings: { ...data.settings, nextSaleNo: data.settings.nextSaleNo + 1 },
@@ -809,26 +890,8 @@ export function completeSale(input: {
     sales: [sale, ...data.sales],
     // A sale on the book is a line in that customer's page, written in the
     // same commit as the sale so the two can never disagree.
-    debts:
-      method === "later" && customer
-        ? [
-            {
-              id: newId("d"),
-              customerId: customer.id,
-              at: new Date().toISOString(),
-              kind: "owed" as const,
-              amount: totals.total,
-              saleId: sale.id,
-              saleNo: sale.no,
-              receiptNo: sale.receiptNo,
-              staffId: who.id,
-              staffName: who.name,
-              note: "",
-            },
-            ...data.debts,
-          ]
-        : data.debts,
-  }));
+    debts: owedLine ? [owedLine, ...data.debts] : data.debts,
+  }), events);
   commitCart([]);
   log(
     method === "later" ? "debt" : "sale",
@@ -838,6 +901,50 @@ export function completeSale(input: {
   );
   if (discount > 0) log("discount", `${sale.receiptNo} ${discount}`);
   return sale;
+}
+
+/**
+ * A sale, as the office stores it.
+ *
+ * The lines go up as they were sold — name and price copied, not
+ * referenced — because a receipt from March has to still read as March's
+ * prices after the shelf price changes.
+ *
+ * What does not go up: the cashier's id, the shift, the discount approver.
+ * The office gets the trade, not the shop's staffing.
+ */
+function saleEvent(sale: Sale) {
+  return event("sale", sale.id, {
+    till_id: sale.deviceId ?? "",
+    receipt_no: sale.receiptNo ?? "",
+    at: sale.at,
+    lines: sale.lines,
+    subtotal: sale.subtotal,
+    discount: sale.discount,
+    rounding: sale.rounding,
+    total: sale.total,
+    method: sale.method,
+    tendered: sale.tendered,
+    change_given: sale.change,
+    staff_name: sale.staffName ?? "",
+    customer_id: sale.customerId ?? null,
+    customer_name: sale.customerName ?? "",
+  }, sale.at);
+}
+
+/** One line of one customer's page. Signed, so a tab is the sum of its
+    lines and nobody has to know the word "owed" to add it up. */
+function debtEvent(entry: DebtEntry) {
+  return event("debt", entry.id, {
+    customer_id: entry.customerId,
+    amount: entry.kind === "paid" ? -entry.amount : entry.amount,
+    note: entry.note ?? "",
+    receipt_no: entry.receiptNo ?? "",
+    sale_id: entry.saleId ?? null,
+    staff_name: entry.staffName ?? "",
+    till_id: data.settings.tillId,
+    at: entry.at,
+  }, entry.at);
 }
 
 /** Voiding is the only correction a market till needs: the goods come back,
@@ -853,6 +960,22 @@ export function voidSale(id: string, reason = "", approvedBy = "") {
     returned.set(line.productId, (returned.get(line.productId) ?? 0) + line.qty);
   }
 
+  const at = new Date().toISOString();
+  /* A void is its own event, not an edit of the sale. The sale in the
+     office is never rewritten — this lands beside it and a trigger folds
+     it in, once, keeping whoever approved the first one. */
+  const events = [
+    event("void", newId("v"), {
+      sale_id: sale.id,
+      at,
+      voided_by: approvedBy,
+      reason,
+    }, at),
+    ...[...returned.entries()].map(([productId, qty]) =>
+      stockEvent(productId, qty, "void", data.settings.tillId, sale.id, at),
+    ),
+  ];
+
   commit({
     ...data,
     products: data.products.map((p) =>
@@ -860,17 +983,12 @@ export function voidSale(id: string, reason = "", approvedBy = "") {
     ),
     sales: data.sales.map((s) =>
       s.id === id
-        ? {
-            ...s,
-            voidedAt: new Date().toISOString(),
-            voidedBy: approvedBy,
-            voidReason: reason,
-          }
+        ? { ...s, voidedAt: at, voidedBy: approvedBy, voidReason: reason }
         : s,
     ),
     // A voided sale on the book was never owed.
     debts: data.debts.filter((entry) => entry.saleId !== id),
-  });
+  }, events);
   log("void", `${sale.receiptNo || sale.no} ${sale.total} — ${reason}`, approvedBy);
 }
 
@@ -1181,13 +1299,22 @@ export function saveCustomer(input: { id?: string; name: string; phone: string }
     name: input.name.trim(),
     phone: input.phone.trim(),
     createdAt: existing?.createdAt ?? new Date().toISOString(),
+    editedAt: new Date().toISOString(),
   };
+  const at = new Date().toISOString();
   commit({
     ...data,
     customers: existing
       ? data.customers.map((c) => (c.id === customer.id ? customer : c))
       : [...data.customers, customer],
-  });
+  }, [
+    event("customer", newId("ce"), {
+      customer_id: customer.id,
+      name: customer.name,
+      phone: customer.phone,
+      edited_at: at,
+    }, at),
+  ]);
   return customer;
 }
 
@@ -1223,9 +1350,251 @@ export function recordPayment(customerId: string, amount: number, note = "") {
     staffName: who.name,
     note,
   };
-  commit({ ...data, debts: [entry, ...data.debts] });
+  commit({ ...data, debts: [entry, ...data.debts] }, [debtEvent(entry)]);
   log("payment", `${customer?.name ?? customerId} paid ${amount}`);
 }
+
+
+/* ------------------------------------------------------- down from the office */
+
+/**
+ * What another till of the same shop has done.
+ *
+ * Rows exactly as PostgREST hands them over, so the sync worker stays a
+ * transport and the knowledge of what a sale *is* stays here.
+ */
+export interface FromCloud {
+  sales: Record<string, unknown>[];
+  voids: Record<string, unknown>[];
+  moves: Record<string, unknown>[];
+  products: Record<string, unknown>[];
+  customers: Record<string, unknown>[];
+  debts: Record<string, unknown>[];
+}
+
+const text = (row: Record<string, unknown>, key: string, fallback = "") =>
+  typeof row[key] === "string" ? (row[key] as string) : fallback;
+const num = (row: Record<string, unknown>, key: string, fallback = 0) =>
+  typeof row[key] === "number" ? (row[key] as number) : fallback;
+
+/**
+ * Merge it in.
+ *
+ * Three different rules, one per kind of thing, and they are the rules from
+ * the brief rather than anything invented here:
+ *
+ * **Sales, debts — append-only.** Already have it, by id: leave it alone. A
+ * pulled sale never overwrites one of ours, because a sale is a thing that
+ * happened and there is nothing to argue about.
+ *
+ * **Stock — deltas, applied once.** The one thing here that is not
+ * idempotent: applying "-2" twice takes four off the shelf. So every
+ * movement's id is written down as it is applied, in the same transaction,
+ * and one already seen is skipped. Our own till's movements are skipped
+ * outright — the local number already has them.
+ *
+ * **Products, customers — last edit wins, by time.** Not "the one that
+ * arrived last": a till offline for three days pushes Tuesday's price on
+ * Friday and Thursday's price must still stand.
+ *
+ * Writes directly rather than through `commit`, because nothing here is this
+ * till's doing and none of it belongs in the outbox. Sending another till's
+ * sale back to the office would be harmless — the id would collide and the
+ * database would ignore it — but it would also mean two tills pushing each
+ * other's trade round in a circle for ever.
+ */
+export async function applyFromCloud(batch: FromCloud): Promise<number> {
+  /* The network can come back before the books have finished loading — a
+     tablet woken on a counter with the wifi already on does exactly that.
+     Merging into a half-read book would write the sample shelf over the
+     shop's own. */
+  await booted;
+  /* A till that fell back to localStorage is not on the Cloud plan and has
+     no second tablet to merge with. */
+  if (storageMode !== "idb") return 0;
+
+  const changes: Change[] = [];
+  let applied = 0;
+
+  /* ---- sales, and the voids that landed on them */
+  const haveSale = new Map(data.sales.map((sale) => [sale.id, sale]));
+  const newSales: Sale[] = [];
+  const changedSales = new Map<string, Sale>();
+
+  for (const row of batch.sales) {
+    const id = text(row, "id");
+    if (!id) continue;
+    const mine = haveSale.get(id);
+    if (!mine) {
+      newSales.push({
+        id,
+        no: 0,
+        receiptNo: text(row, "receipt_no"),
+        deviceId: text(row, "till_id"),
+        at: text(row, "at", new Date().toISOString()),
+        lines: Array.isArray(row.lines) ? (row.lines as Sale["lines"]) : [],
+        subtotal: num(row, "subtotal"),
+        discount: num(row, "discount"),
+        rounding: num(row, "rounding"),
+        total: num(row, "total"),
+        method: (text(row, "method", "cash") as Sale["method"]),
+        tendered: num(row, "tendered"),
+        change: num(row, "change_given"),
+        staffId: "",
+        staffName: text(row, "staff_name"),
+        shiftId: "",
+        voidedAt: text(row, "voided_at") || undefined,
+        voidedBy: text(row, "voided_by") || undefined,
+        voidReason: text(row, "void_reason") || undefined,
+        customerId: text(row, "customer_id") || undefined,
+        customerName: text(row, "customer_name") || undefined,
+      });
+      applied += 1;
+    } else if (!mine.voidedAt && text(row, "voided_at")) {
+      /* The only way a sale we already hold changes: another till voided
+         it. Nothing else about it is ever rewritten from the office. */
+      changedSales.set(id, {
+        ...mine,
+        voidedAt: text(row, "voided_at"),
+        voidedBy: text(row, "voided_by"),
+        voidReason: text(row, "void_reason"),
+      });
+      applied += 1;
+    }
+  }
+
+  /* ---- stock, each movement once */
+  const seen = new Set((await readAll<{ id: string }>("moves")).map((one) => one.id));
+  const mineTill = data.settings.tillId;
+  const byProduct = new Map<string, number>();
+  const nowSeen: { id: string; at: string }[] = [];
+
+  for (const row of batch.moves) {
+    const id = text(row, "id");
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    nowSeen.push({ id, at: text(row, "at") });
+    // Ours is already in the number on this tablet.
+    if (text(row, "till_id") === mineTill) continue;
+    const product = text(row, "product_id");
+    if (!product) continue;
+    byProduct.set(product, (byProduct.get(product) ?? 0) + num(row, "delta"));
+    applied += 1;
+  }
+
+  /* ---- the shelf */
+  const products = new Map(data.products.map((one) => [one.id, one]));
+  for (const row of batch.products) {
+    const id = text(row, "product_id");
+    if (!id) continue;
+    const when = text(row, "edited_at");
+    const mine = products.get(id);
+    if (mine && (mine.editedAt ?? "") >= when) continue;
+    products.set(id, {
+      id,
+      name: text(row, "name"),
+      barcode: text(row, "barcode"),
+      categoryId: text(row, "category"),
+      price: num(row, "price"),
+      stock: mine?.stock ?? 0,
+      lowStockAt: num(row, "low_stock_at", -1),
+      archived: Boolean(row.archived),
+      editedAt: when,
+    });
+    applied += 1;
+  }
+  for (const [id, delta] of byProduct) {
+    const mine = products.get(id);
+    if (mine) products.set(id, { ...mine, stock: mine.stock + delta });
+    /* A movement for a product this tablet has never heard of: the edit
+       that creates it is in the same pull or the next one, and the
+       movement is already counted as seen, so the stock would be lost.
+       Hold the delta until the product arrives. */
+    else pendingStock.set(id, (pendingStock.get(id) ?? 0) + delta);
+  }
+  for (const [id, delta] of [...pendingStock]) {
+    const mine = products.get(id);
+    if (!mine) continue;
+    products.set(id, { ...mine, stock: mine.stock + delta });
+    pendingStock.delete(id);
+  }
+
+  /* ---- the debt book */
+  const customers = new Map(data.customers.map((one) => [one.id, one]));
+  for (const row of batch.customers) {
+    const id = text(row, "customer_id");
+    if (!id) continue;
+    const when = text(row, "edited_at");
+    const mine = customers.get(id);
+    if (mine && (mine.editedAt ?? "") >= when) continue;
+    customers.set(id, {
+      id,
+      name: text(row, "name"),
+      phone: text(row, "phone"),
+      createdAt: mine?.createdAt ?? when,
+      editedAt: when,
+    });
+    applied += 1;
+  }
+
+  const haveDebt = new Set(data.debts.map((one) => one.id));
+  const newDebts: DebtEntry[] = [];
+  for (const row of batch.debts) {
+    const id = text(row, "id");
+    if (!id || haveDebt.has(id)) continue;
+    const amount = num(row, "amount");
+    newDebts.push({
+      id,
+      customerId: text(row, "customer_id"),
+      at: text(row, "at", new Date().toISOString()),
+      kind: amount < 0 ? "paid" : "owed",
+      amount: Math.abs(amount),
+      saleId: text(row, "sale_id") || undefined,
+      receiptNo: text(row, "receipt_no") || undefined,
+      staffId: "",
+      staffName: text(row, "staff_name"),
+      note: text(row, "note"),
+    });
+    applied += 1;
+  }
+
+  if (applied === 0 && nowSeen.length === 0) return 0;
+
+  const nextProducts = [...products.values()];
+  const nextCustomers = [...customers.values()];
+  const nextSales = [
+    ...newSales,
+    ...data.sales.map((sale) => changedSales.get(sale.id) ?? sale),
+  ].sort((a, b) => b.at.localeCompare(a.at));
+  const nextDebts = [...newDebts, ...data.debts].sort((a, b) => b.at.localeCompare(a.at));
+
+  if (newSales.length || changedSales.size) {
+    changes.push({ store: "sales", put: [...newSales, ...changedSales.values()] });
+  }
+  if (newDebts.length) changes.push({ store: "debts", put: newDebts });
+  changes.push({ store: "products", put: nextProducts });
+  changes.push({ store: "customers", put: nextCustomers });
+  /* Written in the same transaction as the stock they moved. If the tablet
+     dies here, either both landed or neither did, and a movement is never
+     counted twice. */
+  if (nowSeen.length) changes.push({ store: "moves", put: nowSeen });
+
+  await write(changes);
+
+  data = {
+    ...data,
+    sales: nextSales,
+    debts: nextDebts,
+    products: nextProducts,
+    customers: nextCustomers,
+  };
+  notify();
+  return applied;
+}
+
+/** Stock movements for a product this tablet has not been told about yet,
+    held until the edit that creates it arrives. */
+const pendingStock = new Map<string, number>();
 
 /* --------------------------------------------------------------- closing up */
 
@@ -1347,6 +1716,20 @@ export function closeDay(day: string, countedCash: number, approvedBy: string) {
     // Closing the same day twice replaces the earlier count rather than
     // stacking two contradictory ones.
     closes: [close, ...data.closes.filter((row) => row.day !== day)],
-  });
+  }, [
+    /* A fresh id each time, so a recount arrives as a second close rather
+       than overwriting the first. What the drawer held at nine and what it
+       held at ten are both things that happened. */
+    event("close", close.id, {
+      till_id: data.settings.tillId,
+      day: close.day,
+      closed_at: close.closedAt,
+      staff_name: close.staffName ?? "",
+      sales_count: close.sales,
+      takings: close.gross,
+      counted_cash: close.countedCash,
+      difference: close.difference,
+    }, close.closedAt),
+  ]);
   log("shift-close", `${day} counted ${countedCash}, expected ${figures.expectedCash}`, approvedBy);
 }

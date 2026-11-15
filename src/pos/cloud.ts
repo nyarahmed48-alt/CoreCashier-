@@ -198,6 +198,20 @@ async function token(): Promise<string> {
   }
 }
 
+/**
+ * A call to the office with this till's token on it.
+ *
+ * The one way the sync worker talks to PostgREST. Exported rather than the
+ * raw `call` so that renewing an expired token is something no caller has to
+ * remember to do.
+ */
+export async function rest(
+  path: string,
+  options: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
+): Promise<unknown> {
+  return call(path, { ...options, token: await token() });
+}
+
 /* ------------------------------------------------------------- signing in */
 
 export async function signIn(email: string, password: string): Promise<Shop> {

@@ -25,7 +25,7 @@ import { databaseName } from "./edition";
  */
 
 const DB_NAME = databaseName();
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 /** One store per kind of thing, so a sale can be written without touching the
     products beside it. */
@@ -42,6 +42,22 @@ export const STORES = [
   /** Single-row stores, keyed by a fixed name. */
   "settings",
   "meta",
+  /**
+   * Added in version 2, for the Cloud plan.
+   *
+   * `outbox` is what this till has done and the office has not been told
+   * about. It is a store rather than a localStorage key so that an entry
+   * can be written in the same transaction as the sale it describes —
+   * see outbox.ts.
+   *
+   * `moves` is the stock movements already applied from other tills, kept
+   * so that pulling the same movement twice does not take the stock off
+   * the shelf twice. Everything else that arrives from the office is an
+   * upsert by id and needs no such care; a delta is the one thing that is
+   * not idempotent on its own.
+   */
+  "outbox",
+  "moves",
 ] as const;
 
 export type StoreName = (typeof STORES)[number];
@@ -56,6 +72,10 @@ export function openDatabase(): Promise<IDBDatabase> {
       return;
     }
     const request = indexedDB.open(DB_NAME, DB_VERSION);
+    /* Upgrading only ever adds stores. A shop's books are in the ones that
+       already exist and are not touched, which is why there is no version
+       ladder here: `createObjectStore` for anything missing covers a tablet
+       coming from version 1 and a tablet that has never been opened. */
     request.onupgradeneeded = () => {
       const db = request.result;
       for (const name of STORES) {
