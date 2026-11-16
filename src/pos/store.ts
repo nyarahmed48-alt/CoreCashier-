@@ -512,6 +512,21 @@ export function useCart(): CartLine[] {
   );
 }
 
+/**
+ * Something to do once a sale is complete.
+ *
+ * The sync worker registers itself here rather than the store importing
+ * the worker. The two would otherwise import each other, and a cycle
+ * between the module that holds the books and the module that sends them
+ * is how one of them ends up half-initialised at the worst moment — this
+ * codebase has lost a day to exactly that once already.
+ */
+let afterSale: (() => void) | null = null;
+
+export function onSaleCompleted(listener: (() => void) | null) {
+  afterSale = listener;
+}
+
 /** The basket, without a React hook around it. For the tests, and for
     anything that needs to price the cart outside a render. */
 export function theCart(): CartLine[] {
@@ -893,6 +908,10 @@ export function completeSale(input: {
     debts: owedLine ? [owedLine, ...data.debts] : data.debts,
   }), events);
   commitCart([]);
+  /* Asked for, not awaited. The receipt is already on screen; whoever is
+     listening fires a few seconds later and the cashier never learns
+     whether it worked. */
+  afterSale?.();
   log(
     method === "later" ? "debt" : "sale",
     method === "later"

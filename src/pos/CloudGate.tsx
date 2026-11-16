@@ -21,7 +21,7 @@
  */
 
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { CloudOff, LogIn } from "lucide-react";
+import { CloudOff, LogIn, RefreshCw, UploadCloud } from "lucide-react";
 import {
   CloudError,
   checkStanding,
@@ -37,10 +37,20 @@ import {
 import { CHECK_IN_MS } from "./cloudConfig";
 import { scoped } from "./edition";
 import { reportError } from "./reportIssue";
-import { exportSnapshot, flushed, usePos } from "./store";
+import { exportSnapshot, flushed } from "./store";
 import { useT } from "./useT";
 import { buildStamp } from "./report";
 import { Button, Field } from "./ui";
+import { subscribeOutbox } from "./outbox";
+/* `syncNow` here already means "ask the office where we stand"; the books
+   moving is a different job in a different file. Named apart rather than
+   merged: one is the subscription, the other is the product. */
+import {
+  firstUpload,
+  subscribeSync,
+  syncNow as syncBooksNow,
+  syncState,
+} from "./sync";
 
 const SEEN_KEY = scoped("coreos.pos.cloud.seen.v1");
 
@@ -284,35 +294,9 @@ export function CloudGate({ onIn }: { onIn: () => void }) {
 /* ------------------------------------------------- the panel in Settings */
 
 export function CloudPanel() {
-  const data = usePos();
   const { t } = useT();
   const state = useCloud();
-  const [note, setNote] = useState("");
-  const [busy, setBusy] = useState(false);
   const who = session();
-
-  async function pushEverything() {
-    setBusy(true);
-    setNote("");
-    try {
-      await flushed();
-      const counts = await pushBook(data, true);
-      await refreshShop();
-      sawOffice();
-      publish({ lastSeen: Date.now(), trouble: null });
-      setNote(
-        t("cloud.pushed", {
-          sales: counts.sales,
-          products: counts.products,
-        }),
-      );
-    } catch (problem) {
-      const fault = problem instanceof CloudError ? problem.fault : "server";
-      setNote(t(`cloud.${fault}` as "cloud.server"));
-    } finally {
-      setBusy(false);
-    }
-  }
 
   return (
     <>
@@ -339,13 +323,7 @@ export function CloudPanel() {
         ) : null}
       </div>
 
-      <p className="text-[13px] leading-relaxed text-[#7e87a5]">
-        {t("cloud.pushAllHint")}
-      </p>
-      <Button disabled={busy} onClick={() => void pushEverything()}>
-        {busy ? t("cloud.pushing") : t("cloud.pushAll")}
-      </Button>
-      {note ? <p className="text-[13px] text-[#8ee7bb]">{note}</p> : null}
+      <SyncPanel />
 
       <Button
         variant="quiet"
@@ -356,6 +334,122 @@ export function CloudPanel() {
       >
         {t("cloud.signOut")}
       </Button>
+    </>
+  );
+}
+
+/* ------------------------------------------------- the sync, in Settings */
+
+/**
+ * What the owner gets to see and do about the cloud.
+ *
+ * Three facts and two buttons, because there is nothing else honest to
+ * show: when the books last reached the office, how much is waiting, and a
+ * way to make it go now rather than at the next interval.
+ *
+ * "Sync now" exists for the owner standing in the shop at closing time who
+ * wants to watch it happen before locking up — not because the automatic
+ * loop needs the help. It is the same code path either way.
+ */
+function SyncPanel() {
+  const { t } = useT();
+  const sync = useSyncExternalStore(
+    (listener) => {
+      const stopA = subscribeSync(listener);
+      const stopB = subscribeOutbox(listener);
+      return () => {
+        stopA();
+        stopB();
+      };
+    },
+    syncState,
+    syncState,
+  );
+
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const [progress, setProgress] = useState<{ done: number; all: number } | null>(null);
+
+  async function now() {
+    setBusy(true);
+    setNote("");
+    await syncBooksNow();
+    setBusy(false);
+  }
+
+  async function uploadEverything() {
+    setBusy(true);
+    setNote("");
+    setProgress({ done: 0, all: 0 });
+    try {
+      await firstUpload((done, all) => setProgress({ done, all }));
+      setNote(t("sync.uploaded"));
+    } catch {
+      /* Whatever went wrong, the events are in the queue now and the
+         ordinary loop keeps trying. There is nothing for the shop to do
+         and nothing alarming to tell them. */
+      setNote(t("sync.offline"));
+    } finally {
+      setProgress(null);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <div className="rounded-xl border border-[#1e2740] bg-[#0a0f1c] px-4 py-3">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-[13px] text-[#98a0bb]">{t("sync.lastSync")}</span>
+          <span dir="ltr" className="text-[13px] text-[#e7eaf6]">
+            {sync.lastOk
+              ? new Date(sync.lastOk).toLocaleString("en-GB")
+              : t("sync.never")}
+          </span>
+        </div>
+        <div className="mt-1.5 flex items-center justify-between gap-3">
+          <span className="text-[13px] text-[#98a0bb]">{t("sync.waitingLabel")}</span>
+          <span
+            className={`text-[13px] font-semibold tabular-nums ${
+              sync.waiting > 0 ? "text-[#f0c078]" : "text-[#8ee7bb]"
+            }`}
+          >
+            {sync.waiting > 0 ? sync.waiting : t("sync.nothingWaiting")}
+          </span>
+        </div>
+      </div>
+
+      {progress ? (
+        <div>
+          <div className="h-2 w-full overflow-hidden rounded-full bg-[#141b2d]">
+            <div
+              className="h-full rounded-full bg-[#6c7bf0] transition-[width] duration-200"
+              style={{
+                width: `${progress.all ? (progress.done / progress.all) * 100 : 0}%`,
+              }}
+            />
+          </div>
+          <p className="mt-1.5 text-[12.5px] text-[#98a0bb]">
+            {t("sync.uploading", { done: progress.done, all: progress.all })}
+          </p>
+        </div>
+      ) : null}
+
+      <Button disabled={busy} onClick={() => void now()}>
+        <RefreshCw
+          size={15}
+          className={sync.phase === "syncing" ? "animate-spin" : ""}
+        />{" "}
+        {t("sync.now")}
+      </Button>
+
+      <p className="text-[13px] leading-relaxed text-[#7e87a5]">
+        {t("sync.firstUploadHint")}
+      </p>
+      <Button disabled={busy} onClick={() => void uploadEverything()}>
+        <UploadCloud size={15} /> {t("sync.firstUpload")}
+      </Button>
+
+      {note ? <p className="text-[13px] text-[#8ee7bb]">{note}</p> : null}
     </>
   );
 }

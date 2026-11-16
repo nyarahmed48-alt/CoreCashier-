@@ -32,8 +32,11 @@
 import { CloudError, knownShop, rest } from "./cloud";
 import {
   confirmed,
+  enqueue,
+  event,
   outboxAll,
   outboxCount,
+  subscribeOutbox,
   tried,
   type EventKind,
   type OutEvent,
@@ -41,7 +44,13 @@ import {
 import { scoped } from "./edition";
 import { reportError } from "./reportIssue";
 import { write } from "./db";
-import { applyFromCloud, exportSnapshot, flushed, type FromCloud } from "./store";
+import {
+  applyFromCloud,
+  exportSnapshot,
+  flushed,
+  onSaleCompleted,
+  type FromCloud,
+} from "./store";
 
 /** Which table each kind of event becomes a row in. */
 const TABLE: Record<EventKind, string> = {
@@ -298,6 +307,17 @@ export function syncState(): SyncState {
   return state;
 }
 
+/*
+ * The waiting count follows the queue, not the last sync attempt.
+ *
+ * `state` is a frozen snapshot — that is what useSyncExternalStore needs —
+ * so a component re-rendering because the outbox changed would still read
+ * the number from whenever the last round finished. Three sales rung up
+ * between two attempts showed as one. Republishing on every outbox change
+ * keeps the dot honest, which is the only thing it is for.
+ */
+subscribeOutbox(() => publish({}));
+
 /** True once the shop has been out of touch long enough to be told. Only
     counts if something is actually waiting — a shop that has sold nothing
     for three days is not a shop with a backup problem. */
@@ -379,12 +399,14 @@ export function watchSync(): () => void {
   void tick();
   window.addEventListener("online", onBack);
   document.addEventListener("visibilitychange", onBack);
+  onSaleCompleted(nudge);
 
   return () => {
     stopped = true;
     window.clearTimeout(timer);
     window.removeEventListener("online", onBack);
     document.removeEventListener("visibilitychange", onBack);
+    onSaleCompleted(null);
   };
 }
 
@@ -415,9 +437,148 @@ async function remember(change: ReturnType<typeof confirmed>) {
   }
 }
 
-/** For the first upload of a shop moving from Offline to Cloud. Walks the
-    whole book into the outbox so the ordinary push can take it from there,
-    in batches, with somewhere to report progress to. */
-export function backlog(): number {
-  return exportSnapshot().sales.length;
+/* ------------------------------------------------- the first time ever */
+
+/**
+ * A shop moving from the Offline plan, with a year of trade on the tablet.
+ *
+ * Everything already in the books is turned into events and pushed, once.
+ * It is safe to run twice, three times, or halfway and then again
+ * tomorrow — every row carries the id it already has, and the database
+ * ignores one it has seen. That is the same property the ordinary push
+ * relies on, which is why there is no separate "have we done this yet"
+ * flag to get wrong.
+ *
+ * Stock goes up as one `opening` movement per product rather than as a
+ * number, so that the shelf in the office is built out of movements from
+ * the very first row and there is never a moment where it is half one
+ * thing and half the other.
+ *
+ * `onProgress` is called with how far through it is, for the bar in
+ * Settings. The work is done in chunks with a yield between them so the
+ * till stays usable while it runs — an owner who has just signed up should
+ * be able to serve a customer during it.
+ */
+export async function firstUpload(
+  onProgress: (done: number, all: number) => void,
+): Promise<number> {
+  const book = exportSnapshot();
+  const till = book.settings.tillId;
+
+  const events: OutEvent[] = [];
+  for (const product of book.products) {
+    const at = product.editedAt ?? new Date().toISOString();
+    events.push(event("product", `pe-first-${product.id}`, {
+      product_id: product.id,
+      name: product.name,
+      barcode: product.barcode ?? "",
+      category: product.categoryId ?? "",
+      price: product.price,
+      low_stock_at: product.lowStockAt,
+      archived: Boolean(product.archived),
+      edited_at: at,
+      till_id: till,
+    }, at));
+    if (product.stock !== 0) {
+      /* A fixed id, derived from the product's: run this twice and the
+         second opening movement is the same row, not a second delivery. */
+      events.push(event("stock", `m-open-${product.id}`, {
+        till_id: till,
+        product_id: product.id,
+        delta: product.stock,
+        reason: "opening",
+        sale_id: null,
+        at,
+      }, at));
+    }
+  }
+
+  for (const customer of book.customers) {
+    const at = customer.editedAt ?? customer.createdAt;
+    events.push(event("customer", `ce-first-${customer.id}`, {
+      customer_id: customer.id,
+      name: customer.name,
+      phone: customer.phone,
+      edited_at: at,
+    }, at));
+  }
+
+  for (const sale of book.sales) {
+    events.push(event("sale", sale.id, {
+      till_id: sale.deviceId ?? till,
+      receipt_no: sale.receiptNo ?? "",
+      at: sale.at,
+      lines: sale.lines,
+      subtotal: sale.subtotal,
+      discount: sale.discount,
+      rounding: sale.rounding,
+      total: sale.total,
+      method: sale.method,
+      tendered: sale.tendered,
+      change_given: sale.change,
+      staff_name: sale.staffName ?? "",
+      customer_id: sale.customerId ?? null,
+      customer_name: sale.customerName ?? "",
+    }, sale.at));
+    if (sale.voidedAt) {
+      events.push(event("void", `v-first-${sale.id}`, {
+        sale_id: sale.id,
+        at: sale.voidedAt,
+        voided_by: sale.voidedBy ?? "",
+        reason: sale.voidReason ?? "",
+      }, sale.voidedAt));
+    }
+  }
+
+  for (const entry of book.debts) {
+    events.push(event("debt", entry.id, {
+      customer_id: entry.customerId,
+      amount: entry.kind === "paid" ? -entry.amount : entry.amount,
+      note: entry.note ?? "",
+      receipt_no: entry.receiptNo ?? "",
+      sale_id: entry.saleId ?? null,
+      staff_name: entry.staffName ?? "",
+      till_id: till,
+      at: entry.at,
+    }, entry.at));
+  }
+
+  for (const close of book.closes) {
+    events.push(event("close", close.id, {
+      till_id: till,
+      day: close.day,
+      closed_at: close.closedAt,
+      staff_name: close.staffName ?? "",
+      sales_count: close.sales,
+      takings: close.gross,
+      counted_cash: close.countedCash,
+      difference: close.difference,
+    }, close.closedAt));
+  }
+
+  const all = events.length;
+  onProgress(0, all);
+
+  /* Into the queue a chunk at a time, writing each chunk to disk, so that
+     a tablet that dies partway through comes back having kept the part it
+     had done rather than starting the year again. */
+  for (let at = 0; at < events.length; at += 200) {
+    const chunk = events.slice(at, at + 200);
+    const change = enqueue(chunk);
+    if (change) await write([change]);
+    onProgress(Math.min(at + chunk.length, all), all);
+    await new Promise((go) => setTimeout(go, 0));
+  }
+
+  /* Then the ordinary push empties it, in its ordinary batches, with its
+     ordinary retrying. Nothing about this path is special once the events
+     are in the queue — which is the point. */
+  let sent = 0;
+  while (outboxCount() > 0) {
+    const went = await pushOutbox();
+    if (went === 0) break;
+    sent += went;
+    onProgress(all - outboxCount(), all);
+  }
+  return sent;
 }

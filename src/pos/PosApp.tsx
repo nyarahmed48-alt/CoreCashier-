@@ -62,6 +62,8 @@ import {
 import { standing, watchLicence } from "./licenceServer";
 import { watchSession } from "./technician";
 import { isCloud, isDemo, isLoaner, needsNoLicence } from "./edition";
+import { SyncBehind, SyncDot } from "./SyncDot";
+import { watchSync } from "./sync";
 import { daysOut, overdue } from "./loaner";
 import {
   CloudGate,
@@ -182,7 +184,17 @@ export default function PosApp() {
      push and nobody to ask. */
   useEffect(() => {
     if (!isCloud || !cloudIn) return;
-    return watchCloud();
+    /* Two loops, deliberately apart. `watchCloud` asks the office whether
+       this till may still sell, which is the subscription. `watchSync`
+       moves the shop's books, which is the product. A frozen till still
+       runs the second one: stopping a shop for not paying is not a reason
+       to stop its records reaching the place it can get them back from. */
+    const standing = watchCloud();
+    const books = watchSync();
+    return () => {
+      standing();
+      books();
+    };
   }, [cloudIn]);
 
   /* Being signed out by the office puts the sign-in screen back. */
@@ -260,10 +272,17 @@ export default function PosApp() {
     >
       <style>{PRINT_CSS}</style>
       <ErrorCard />
+      {isCloud ? <SyncBehind /> : null}
 
       <header className="pos-noprint flex shrink-0 items-center justify-between gap-3 border-b border-[#1b2337] px-3 py-2.5 sm:px-4">
         <div className="flex min-w-0 items-center gap-2.5">
-          <span className="inline-block h-2 w-2 shrink-0 rounded-full bg-[#6c7bf0]" />
+          {/* On the Cloud plan this dot means something; on every other it
+              is the decoration it has always been. */}
+          {isCloud ? (
+            <SyncDot />
+          ) : (
+            <span className="inline-block h-2 w-2 shrink-0 rounded-full bg-[#6c7bf0]" />
+          )}
           <span className="truncate font-display text-[15px] font-semibold text-white">
             {data.settings.shopName}
           </span>
